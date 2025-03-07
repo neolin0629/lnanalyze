@@ -4,110 +4,231 @@ Statistical functions for research assistance
 @date: 2024/6/20
 """
 
-from math import isinf
-import string
+from typing import Optional, Union, List
+
 import numpy as np
 import pandas as pd
 import polars as pl
-from polars import Boolean
-from polars import Float64
+
 import statsmodels.api as sm
 
-
-from typing import Optional, Union, List
-
-from qxgentools.utils.typing import ArrayLike, DataFrameLike
+# ArrayLike = Union[list, np.ndarray, pd.Series, pl.Series]
+from lntools.utils.typing import ArrayLike, DataFrameLike
 
 
-DEFAULT_TRADING_DAYS_PER_YEAR = 250 # Default trading days per year
+DEFAULT_TRADING_DAYS_PER_YEAR = 250  # Default trading days per year
 
-def calculate_stats(series: np.ndarray):
+
+def _arraylike_to_array(series: ArrayLike) -> np.ndarray:
+    # Convert input to numpy array for consistent handling
+    if isinstance(series, (list, np.ndarray)):
+        series = np.array(series, dtype=float)
+    elif isinstance(series, pd.Series):
+        series = series.to_numpy(dtype=float)
+    elif isinstance(series, pl.Series):
+        series = series.to_numpy()
+    else:
+        raise TypeError(
+            f"Unsupported type: {type(series)}. Expected list, numpy array, pandas Series, or polars Series"
+        )
+
+    return series
+
+
+def calculate_stats(series: ArrayLike) -> tuple:
     """Calculating statistics for a given data series: mean, standard deviation and median"""
+    # Convert input to numpy array for consistent handling
+    series = _arraylike_to_array(series)
+
+    # Handle empty arrays
+    if len(series) == 0:
+        return float('nan'), float('nan'), float('nan')
     mean = np.mean(series, dtype=float)
     std = np.std(series, dtype=float)
     median = np.median(series)
     return mean, std, median
 
+
 def extreme_mad(series: ArrayLike, n: float) -> np.ndarray:
     """
     Outlier handling using Median Absolute Deviation (MAD).
     """
-    series = np.array(series)
+    series = _arraylike_to_array(series)
+
     median, _, _ = calculate_stats(series)
     mad = np.median(np.abs(series - median))
     max_range = median + n * mad
     min_range = median - n * mad
     return np.clip(series, min_range, max_range)
 
+
 def extreme_nsigma(series: ArrayLike, n: float = 3) -> np.ndarray:
     """
     Outlier handling using n standard deviations (sigma).
     """
-    series = np.array(series)
+    series = _arraylike_to_array(series)
+
     mean, std, _ = calculate_stats(series)
     max_range = mean + n * std
     min_range = mean - n * std
     return np.clip(series, min_range, max_range)
 
-def extreme_percentile(series: ArrayLike, min_percent: float = 0.025, max_percent: float = 0.975) -> np.ndarray:
+
+def extreme_percentile(
+    series: ArrayLike,
+    min_percent: float = 0.025,
+    max_percent: float = 0.975
+) -> np.ndarray:
     """
     Outlier handling based on percentiles.
     """
-    series = np.array(series)
+    series = _arraylike_to_array(series)
     low = np.percentile(series, min_percent * 100)
     high = np.percentile(series, max_percent * 100)
     return np.clip(series, low, high)
+
 
 def zscore(series: ArrayLike) -> np.ndarray:
     """
     Standardization of a series using z-score.
     """
-    series = np.array(series)
+    series = _arraylike_to_array(series)
     mean, std, _ = calculate_stats(series)
     return (series - mean) / std
 
 
 def _prepare_data_for_neutralization(df: DataFrameLike, factors: list, target: str) -> tuple:
-    """Prepare data for regression, handling both pandas and Polars DataFrame."""
+    """
+    Prepares data for regression-based factor neutralization by extracting target variable and factor data.
+
+    Parameters
+    ----------
+    df : DataFrameLike
+        Input dataframe (pandas or Polars) containing target and factor columns
+    factors : list
+        List of column names to use as factors for neutralization
+    target : str
+        Column name of the target variable
+
+    Returns
+    -------
+    tuple
+        (y, x) where y is the target variable and x contains predictor variables
+    """
+    # Filter only valid factors present in the dataframe
+    valid_factors = [f for f in factors if f in df.columns]
+
+    if not valid_factors:
+        raise ValueError("No valid factors provided")
+
     if isinstance(df, pd.DataFrame):
         y = df[target].astype(float)
-        x_list = [df[factor].astype(float) if factor != 'industry' else pd.get_dummies(df['industry']) 
-                  for factor in factors if factor in df.columns]
+
+        # Handle factors more efficiently
+        x_frames = []
+        for factor in valid_factors:
+            if factor == 'industry':
+                x_frames.append(pd.get_dummies(df['industry']))
+            else:
+                x_frames.append(df[[factor]].astype(float))
+
+        x = pd.concat(x_frames, axis=1) if len(x_frames) > 1 else x_frames[0]
+
     elif isinstance(df, pl.DataFrame):
         y = df.get_column(target).cast(pl.Float64)
-        x_list = [df.select(factor).cast(pl.Float64) if factor != 'industry' else df.select('industry').to_dummies() 
-                  for factor in factors if factor in df.columns]
-    else:
-        raise ValueError("Unsupported dataframe type")
 
-    if not x_list:
-        raise ValueError("No valid factors provided")
-    
-    x = x_list[0] if len(x_list) == 1 else (pd.concat(x_list, axis=1) if isinstance(df, pd.DataFrame) else pl.concat(x_list, how='horizontal'))
+        # Handle factors more efficiently
+        x_frames = []
+        for factor in valid_factors:
+            if factor == 'industry':
+                x_frames.append(df.select('industry').to_dummies())
+            else:
+                x_frames.append(df.select(pl.col(factor).cast(pl.Float64)))
+
+        x = pl.concat(x_frames, how='horizontal') if len(x_frames) > 1 else x_frames[0]
+
+        y = y.to_pandas()  # Convert to pandas Series, Excessive data volume can affect performance
+        x = x.to_pandas()  # Convert to pandas DataFrame
+
+    else:
+        raise TypeError(f"Unsupported dataframe type: {type(df)}. Expected pandas DataFrame or polars DataFrame.")
 
     return y, x
 
-def neutralization_by_OLS(df: DataFrameLike, factors: Union[str, list] = ["mktcap", "industry"]) -> np.ndarray:
-    """Perform OLS to neutralize factors and extract residuals."""
-    if isinstance(factors, str):
+
+def neutralization_by_ols(
+    df: DataFrameLike,
+    factors: Optional[Union[str, list]] = None
+) -> np.ndarray:
+    """
+    Perform OLS regression to neutralize factors and extract residuals.
+
+    Parameters
+    ----------
+    df : DataFrameLike
+        Input dataframe containing 'factor' column and factor columns
+    factors : Union[str, list], default=["mktcap", "industry"]
+        Factor or list of factors to neutralize against
+
+    Returns
+    -------
+    np.ndarray
+        Residuals after neutralization
+    """
+    if factors is None:
+        factors = ["mktcap", "industry"]
+    elif isinstance(factors, str):
         factors = [factors]
 
+    # 'factor' is y, neutralize x
     y, x = _prepare_data_for_neutralization(df, factors, 'factor')
-    x = sm.add_constant(x) if isinstance(x, pd.DataFrame) else x.with_columns(pl.lit(1).alias('const'))
+
+    # Add constant term based on dataframe type
+    x = sm.add_constant(x)
+
+    # Fit OLS model and return residuals
     model = sm.OLS(y, x)
-    results = model.fit()
-    return results.resid
+    return model.fit().resid
 
-def neutralization_by_inv(df: DataFrameLike, factors: Union[str, list] = ["mktcap", "industry"]) -> np.ndarray:
-    """Perform matrix inversion to neutralize factors and extract residuals."""
-    if isinstance(factors, str):
+
+def neutralization_by_inv(
+    df: DataFrameLike,
+    factors: Optional[Union[str, list]] = None
+) -> np.ndarray:
+    """
+    Perform matrix inversion to neutralize factors and extract residuals.
+
+    Parameters
+    ----------
+    df : DataFrameLike
+        Input dataframe containing 'factor' column and factor columns
+    factors : Union[str, list], default=["mktcap", "industry"]
+        Factor or list of factors to neutralize against
+
+    Returns
+    -------
+    np.ndarray
+        Residuals after neutralization
+    """
+    if factors is None:
+        factors = ["mktcap", "industry"]
+    elif isinstance(factors, str):
         factors = [factors]
 
     y, x = _prepare_data_for_neutralization(df, factors, 'factor')
-    x = np.column_stack([np.ones(len(x)), x]) if isinstance(x, pd.DataFrame) else np.hstack([np.ones((x.height, 1)), x.to_numpy()])
-    beta = np.linalg.inv(x.T.dot(x)).dot(x.T).dot(y)
-    residuals = y - x.dot(beta)
-    return residuals
+
+    # Convert to numpy and add constant column
+    if isinstance(x, pd.DataFrame):
+        x_array = np.column_stack([np.ones(len(x)), x.to_numpy()])
+        y_array = y.to_numpy()
+    else:  # polars DataFrame
+        x_array = np.column_stack([np.ones(x.height), x.to_numpy()])
+        y_array = y.to_numpy()
+
+    # Compute beta using matrix inversion and return residuals
+    # Using more numerically stable approach with np.linalg.lstsq
+    beta, _, _, _ = np.linalg.lstsq(x_array, y_array, rcond=None)
+    return y_array - x_array @ beta
 
 
 def sharpe(returns: Union[DataFrameLike, ArrayLike],
@@ -151,6 +272,7 @@ def ic(data: DataFrameLike, factor_column: str, return_column: str, method: str 
 
     return ic_value
 
+
 def ic_batch(data: pl.DataFrame, factor_column: list[str], return_column: str, method: str = 'spearman') -> float:
     """
     Calculate the Information Coefficient (IC).
@@ -173,6 +295,7 @@ def ic_batch(data: pl.DataFrame, factor_column: list[str], return_column: str, m
 
     ic_value = factor_df.corrwith(valid_data[return_column], method=method).sort_values(ascending=False)
     return ic_value
+
 
 def factor_stat(data: pl.DataFrame, factor_column:str, return_column:str, groups:Optional[int]=5) -> pl.DataFrame:
     """
@@ -223,6 +346,8 @@ def factor_stat(data: pl.DataFrame, factor_column:str, return_column:str, groups
         raise ValueError("Unsupported factor column type. Expected string or number. Your factor column type is: ", valid_data[factor_column].dtype)
     
     return stat_df
+
+
 if __name__=='__main__':
     # ! test `extreme` & `zscore`
     # data = [10, 20, 30, 40, 50, 100]
