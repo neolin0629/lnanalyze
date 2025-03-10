@@ -15,6 +15,7 @@ import statsmodels.api as sm
 # ArrayLike = Union[list, np.ndarray, pd.Series, pl.Series]
 from lntools.utils.typing import ArrayLike, DataFrameLike
 
+# test git
 
 DEFAULT_TRADING_DAYS_PER_YEAR = 250  # Default trading days per year
 
