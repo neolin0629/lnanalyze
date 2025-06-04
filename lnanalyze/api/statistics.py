@@ -156,7 +156,7 @@ def _prepare_data_for_neutralization(df: DataFrameLike, factors: list, target: s
     return y, x
 
 
-def neutralization_by_ols(
+def neutralization_by_OLS(
     df: DataFrameLike,
     factors: Optional[Union[str, list]] = None
 ) -> np.ndarray:
@@ -311,8 +311,10 @@ def factor_stat(data: pl.DataFrame, factor_column:str, return_column:str, groups
         DataFrame: DataFrame containing the calculated statistics.
     """
     valid_data = data.select([factor_column, return_column]).drop_nulls()
-    #Check if factor_column is in str or numbers
-    if valid_data[factor_column].dtype in [pl.String, pl.Boolean, Boolean, string]:
+    # Check the dtype of the factor column. For string like columns we simply
+    # aggregate by the raw factor value.  Numeric columns will be bucketed
+    # into ``groups`` quantiles.
+    if valid_data[factor_column].dtype in [pl.String, pl.Boolean, pl.Utf8, pl.Categorical]:
         #group by factor_column and calculate agg the mean, std, skewness, kurtosis, and IC
         stat_df = valid_data.group_by(factor_column).agg([
             pl.col(return_column).mean().alias('mean'),
@@ -323,7 +325,7 @@ def factor_stat(data: pl.DataFrame, factor_column:str, return_column:str, groups
             (pl.col(return_column).std() / pl.col(return_column).mean()).alias('CV'),
             pl.col(return_column).count().alias('count'),
         ])
-    elif valid_data[factor_column].dtype in [pl.Int16, pl.Int32, pl.Int8, pl.Int64, pl.Float32, pl.Float32, int, float, Float64]:
+    elif valid_data[factor_column].dtype in [pl.Int16, pl.Int32, pl.Int8, pl.Int64, pl.Float32, pl.Float64, int, float]:
         if isinstance(groups, int) == False:
             raise ValueError("Expected groups to be an integer.")
         valid_data = valid_data.with_columns(
